@@ -2,88 +2,57 @@
 //!
 //! Implement a simple file descriptor (fd) table — the core data structure
 //! for managing open files in an OS kernel.
-//!
-//! ## Background
-//!
-//! In the Linux kernel, each process has an fd table that maps integer fds to kernel file objects.
-//! User programs perform read/write/close via fds, and the kernel looks up the corresponding
-//! file object through the fd table.
-//!
-//! ```text
-//! fd table:
-//!   0 -> Stdin
-//!   1 -> Stdout
-//!   2 -> Stderr
-//!   3 -> File("/etc/passwd")
-//!   4 -> (empty)
-//!   5 -> Socket(...)
-//! ```
-//!
-//! ## Task
-//!
-//! Implement the following methods on `FdTable`:
-//!
-//! - `new()` — create an empty fd table
-//! - `alloc(file)` -> `usize` — allocate a new fd, return the fd number
-//!   - Prefer reusing the smallest closed fd number
-//!   - If no free slot, extend the table
-//! - `get(fd)` -> `Option<Arc<dyn File>>` — get the file object for an fd
-//! - `close(fd)` -> `bool` — close an fd, return whether it succeeded (false if fd doesn't exist)
-//! - `count()` -> `usize` — return the number of currently allocated fds (excluding closed ones)
-//!
-//! ## Key Concepts
-//!
-//! - Trait objects: `Arc<dyn File>`
-//! - `Vec<Option<T>>` as a sparse table
-//! - fd number reuse strategy (find smallest free slot)
-//! - `Arc` reference counting and resource release
 
 use std::sync::Arc;
 
-/// File abstraction trait — all "files" in the kernel (regular files, pipes, sockets) implement this
 pub trait File: Send + Sync {
     fn read(&self, buf: &mut [u8]) -> isize;
     fn write(&self, buf: &[u8]) -> isize;
 }
 
-/// File descriptor table
 pub struct FdTable {
-    // TODO: Design the internal structure
-    // Hint: use Vec<Option<Arc<dyn File>>>
-    //       the index is the fd number, None means the fd is closed or unallocated
+    entries: Vec<Option<Arc<dyn File>>>,
 }
 
 impl FdTable {
-    /// Create an empty fd table
     pub fn new() -> Self {
-        // TODO
-        todo!()
+        Self {
+            entries: Vec::new(),
+        }
     }
 
-    /// Allocate a new fd, return the fd number.
-    ///
-    /// Prefers reusing the smallest closed fd number; if no free slot, appends to the end.
     pub fn alloc(&mut self, file: Arc<dyn File>) -> usize {
-        // TODO
-        todo!()
+        for (i, slot) in self.entries.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(file);
+                return i;
+            }
+        }
+        let fd = self.entries.len();
+        self.entries.push(Some(file));
+        fd
     }
 
-    /// Get the file object for an fd. Returns None if the fd doesn't exist or is closed.
     pub fn get(&self, fd: usize) -> Option<Arc<dyn File>> {
-        // TODO
-        todo!()
+        self.entries.get(fd)?.clone()
     }
 
-    /// Close an fd. Returns true on success, false if the fd doesn't exist or is already closed.
     pub fn close(&mut self, fd: usize) -> bool {
-        // TODO
-        todo!()
+        match self.entries.get_mut(fd) {
+            Some(slot) => {
+                if slot.is_some() {
+                    *slot = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
     }
 
-    /// Return the number of currently allocated fds (excluding closed ones)
     pub fn count(&self) -> usize {
-        // TODO
-        todo!()
+        self.entries.iter().filter(|s| s.is_some()).count()
     }
 }
 
@@ -93,9 +62,6 @@ impl Default for FdTable {
     }
 }
 
-// ============================================================
-// Test File implementation
-// ============================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,9 +123,9 @@ mod tests {
     #[test]
     fn test_close_and_reuse() {
         let mut table = FdTable::new();
-        let fd0 = table.alloc(MockFile::new(0)); // fd=0
-        let fd1 = table.alloc(MockFile::new(1)); // fd=1
-        let fd2 = table.alloc(MockFile::new(2)); // fd=2
+        let fd0 = table.alloc(MockFile::new(0));
+        let fd1 = table.alloc(MockFile::new(1));
+        let fd2 = table.alloc(MockFile::new(2));
 
         assert!(table.close(fd1), "closing fd=1 should succeed");
         assert!(
@@ -167,7 +133,6 @@ mod tests {
             "get should return None after close"
         );
 
-        // Next allocation should reuse fd=1 (smallest free)
         let fd_new = table.alloc(MockFile::new(99));
         assert_eq!(fd_new, fd1, "should reuse the smallest closed fd");
 

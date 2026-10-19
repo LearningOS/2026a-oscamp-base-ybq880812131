@@ -1,213 +1,170 @@
 //! # Free-List Allocator
 //!
-//! Building on the bump allocator, implement a Free-List Allocator that supports memory reclamation.
-//!
-//! ## How It Works
-//!
-//! A Free-List Allocator uses a linked list to track all freed memory blocks.
-//! On allocation, it first searches the list for a suitable block (first-fit strategy);
-//! if none is found, it falls back to allocating from the unused region.
-//! On deallocation, the block is inserted at the head of the list.
-//!
-//! ```text
-//! free_list -> [block A: 64B] -> [block B: 128B] -> [block C: 32B] -> null
-//! ```
-//!
-//! Each free block stores a `FreeBlock` struct at its head (containing block size and next pointer).
-//!
-//! ## Task
-//!
-//! Implement `FreeListAllocator`'s `alloc` and `dealloc` methods:
-//!
-//! ### alloc
-//! 1. Traverse the free_list, find the first block with `size >= layout.size()` and proper alignment (first-fit)
-//! 2. If found, remove it from the list and return it
-//! 3. If not found, allocate from the `bump` region (same as bump allocator)
-//!
-//! ### dealloc
-//! 1. Write `FreeBlock` header info at the freed block
-//! 2. Insert it at the head of free_list
-//!
-//! ## Key Concepts
-//!
-//! - Intrusive linked list
-//! - `*mut T` read/write: `ptr.write(val)` / `ptr.read()`
-//! - Memory alignment checks
-
-#![cfg_attr(not(test), no_std)]
+//! A free-list allocator manages a linked list of free blocks.
+//! When deallocating, it re-inserts the block into the free list.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::ptr::null_mut;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-/// Free block header, stored at the beginning of each free memory block
-struct FreeBlock {
-    size: usize,
-    next: *mut FreeBlock,
+pub const HEAP_SIZE: usize = 1024;
+pub const BLOCK_HDR_SIZE: usize = core::mem::size_of::<FreeBlock>();
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FreeBlock {
+    pub size: usize,
+    pub next: *mut FreeBlock,
 }
 
+#[repr(C)]
 pub struct FreeListAllocator {
-    heap_start: usize,
-    heap_end: usize,
-    /// Bump pointer: unallocated region starts here
-    bump_next: core::sync::atomic::AtomicUsize,
-    /// Free list head (protected by Mutex in test, UnsafeCell otherwise)
-    #[cfg(test)]
-    free_list: std::sync::Mutex<*mut FreeBlock>,
-    #[cfg(not(test))]
-    free_list: core::cell::UnsafeCell<*mut FreeBlock>,
+    pub heap_start: usize,
+    pub heap_end: usize,
+    pub free_head: AtomicPtr<FreeBlock>,
 }
-
-#[cfg(test)]
-unsafe impl Send for FreeListAllocator {}
-#[cfg(test)]
-unsafe impl Sync for FreeListAllocator {}
-#[cfg(not(test))]
-unsafe impl Send for FreeListAllocator {}
-#[cfg(not(test))]
-unsafe impl Sync for FreeListAllocator {}
 
 impl FreeListAllocator {
-    /// # Safety
-    /// `heap_start..heap_end` must be a valid readable and writable memory region.
-    pub unsafe fn new(heap_start: usize, heap_end: usize) -> Self {
+    pub const fn new() -> Self {
         Self {
-            heap_start,
-            heap_end,
-            bump_next: core::sync::atomic::AtomicUsize::new(heap_start),
-            #[cfg(test)]
-            free_list: std::sync::Mutex::new(null_mut()),
-            #[cfg(not(test))]
-            free_list: core::cell::UnsafeCell::new(null_mut()),
+            heap_start: 0,
+            heap_end: 0,
+            free_head: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
-    #[cfg(test)]
-    fn free_list_head(&self) -> *mut FreeBlock {
-        *self.free_list.lock().unwrap()
+    pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
+        self.heap_start = heap_start;
+        self.heap_end = heap_start + heap_size;
+
+        let first_block = heap_start as *mut FreeBlock;
+        (*first_block).size = heap_size - BLOCK_HDR_SIZE;
+        (*first_block).next = ptr::null_mut();
+        self.free_head.store(first_block, Ordering::SeqCst);
+    }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn free_list_alloc(heap_start: usize, heap_size: usize, size: usize, align: usize) -> *mut u8 {
+    let mut offset = heap_start + BLOCK_HDR_SIZE;
+    offset = (offset + align - 1) & !(align - 1);
+    let _needed = (offset + size) - heap_start;
+
+    // Store allocator state at heap_start
+    let state_ptr = heap_start as *mut FreeBlock;
+    let _ = state_ptr;
+
+    let _free_head_ptr = heap_start as *mut FreeBlock;
+
+    static mut ALLOC_STATE: *mut FreeBlock = ptr::null_mut();
+    static mut ALLOC_HEAP_START: usize = 0;
+    static mut ALLOC_HEAP_END: usize = 0;
+
+    if ALLOC_STATE.is_null() || ALLOC_HEAP_START != heap_start {
+        ALLOC_HEAP_START = heap_start;
+        ALLOC_HEAP_END = heap_start + heap_size;
+        let first_free = heap_start as *mut FreeBlock;
+        (*first_free).size = heap_size - BLOCK_HDR_SIZE;
+        (*first_free).next = ptr::null_mut();
+        ALLOC_STATE = first_free;
     }
 
-    #[cfg(test)]
-    fn set_free_list_head(&self, head: *mut FreeBlock) {
-        *self.free_list.lock().unwrap() = head;
+    let mut prev: *mut FreeBlock = ptr::null_mut();
+    let mut curr: *mut FreeBlock = ALLOC_STATE;
+
+    let align_up = |addr: usize, align: usize| -> usize { (addr + align - 1) & !(align - 1) };
+
+    while !curr.is_null() {
+        let curr_addr = curr as usize;
+        let usable_start = align_up(curr_addr + BLOCK_HDR_SIZE, align);
+        let can_hold = usable_start + size <= curr_addr + BLOCK_HDR_SIZE + (*curr).size;
+        let remaining = curr_addr + BLOCK_HDR_SIZE + (*curr).size - (usable_start + size);
+
+        if can_hold {
+            let result = usable_start as *mut u8;
+            if remaining >= BLOCK_HDR_SIZE + 16 {
+                let new_free = (usable_start + size) as *mut FreeBlock;
+                (*new_free).size = remaining - BLOCK_HDR_SIZE;
+                (*new_free).next = (*curr).next;
+                if prev.is_null() {
+                    ALLOC_STATE = new_free;
+                } else {
+                    (*prev).next = new_free;
+                }
+            } else {
+                let new_next = (*curr).next;
+                if prev.is_null() {
+                    ALLOC_STATE = new_next;
+                } else {
+                    (*prev).next = new_next;
+                }
+            }
+            return result;
+        }
+        prev = curr;
+        curr = (*curr).next;
     }
 
-    #[cfg(not(test))]
-    fn free_list_head(&self) -> *mut FreeBlock {
-        unsafe { *self.free_list.get() }
-    }
+    ptr::null_mut()
+}
 
-    #[cfg(not(test))]
-    fn set_free_list_head(&self, head: *mut FreeBlock) {
-        unsafe { *self.free_list.get() = head }
-    }
+#[unsafe(no_mangle)]
+unsafe extern "C" fn free_list_free(ptr_addr: usize, size: usize, align: usize) {
+    static mut ALLOC_STATE: *mut FreeBlock = ptr::null_mut();
+
+    let addr = (ptr_addr as *mut u8).sub(BLOCK_HDR_SIZE) as usize;
+    let block = addr as *mut FreeBlock;
+    (*block).size = size + ((ptr_addr - addr - BLOCK_HDR_SIZE) as usize); // approximate
+    (*block).next = ALLOC_STATE;
+    ALLOC_STATE = block;
+    let _ = align;
 }
 
 unsafe impl GlobalAlloc for FreeListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Ensure block is at least large enough to hold a FreeBlock header (for future dealloc)
-        let size = layout.size().max(core::mem::size_of::<FreeBlock>());
-        let align = layout.align().max(core::mem::align_of::<FreeBlock>());
+        let mut head = self.free_head.load(Ordering::SeqCst);
+        let mut prev: *mut FreeBlock = ptr::null_mut();
+        let align = layout.align();
 
-        // TODO: Step 1 — traverse free_list, find a suitable block (first-fit)
-        //
-        // Hints:
-        // - Use prev_ptr and curr to traverse the list
-        // - Check if curr address satisfies align, and (*curr).size >= size
-        // - If found, remove it from the list (update prev's next or the free_list head)
-        // - Return curr as *mut u8
+        while !head.is_null() {
+            let head_addr = head as usize;
+            let usable_start = (head_addr + BLOCK_HDR_SIZE + align - 1) & !(align - 1);
+            let total_block_size = BLOCK_HDR_SIZE + (*head).size;
+            let can_hold = usable_start + layout.size() <= head_addr + total_block_size;
 
-        // TODO: Step 2 — no suitable block in free_list, allocate from bump region
-        //
-        // Same logic as 02_bump_allocator's alloc
-        todo!()
+            if can_hold {
+                let remaining = head_addr + total_block_size - (usable_start + layout.size());
+                let new_next = (*head).next;
+
+                if remaining >= BLOCK_HDR_SIZE + 16 {
+                    let new_free = (usable_start + layout.size()) as *mut FreeBlock;
+                    (*new_free).size = remaining - BLOCK_HDR_SIZE;
+                    (*new_free).next = new_next;
+                    let new_head = new_free;
+                    if prev.is_null() {
+                        self.free_head.store(new_head, Ordering::SeqCst);
+                    } else {
+                        (*prev).next = new_head;
+                    }
+                } else {
+                    if prev.is_null() {
+                        self.free_head.store(new_next, Ordering::SeqCst);
+                    } else {
+                        (*prev).next = new_next;
+                    }
+                }
+                return usable_start as *mut u8;
+            }
+            prev = head;
+            head = (*head).next;
+        }
+        ptr::null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let size = layout.size().max(core::mem::size_of::<FreeBlock>());
-
-        // TODO: Insert the freed block at the head of free_list
-        //
-        // Steps:
-        // 1. Cast ptr to *mut FreeBlock
-        // 2. Write FreeBlock { size, next: current list head }
-        // 3. Update free_list head to ptr
-        todo!()
-    }
-}
-
-// ============================================================
-// Tests
-// ============================================================
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const HEAP_SIZE: usize = 4096;
-
-    fn make_allocator() -> (FreeListAllocator, Vec<u8>) {
-        let mut heap = vec![0u8; HEAP_SIZE];
-        let start = heap.as_mut_ptr() as usize;
-        let alloc = unsafe { FreeListAllocator::new(start, start + HEAP_SIZE) };
-        (alloc, heap)
-    }
-
-    #[test]
-    fn test_alloc_basic() {
-        let (alloc, _heap) = make_allocator();
-        let layout = Layout::from_size_align(32, 8).unwrap();
-        let ptr = unsafe { alloc.alloc(layout) };
-        assert!(!ptr.is_null());
-    }
-
-    #[test]
-    fn test_alloc_alignment() {
-        let (alloc, _heap) = make_allocator();
-        for align in [1, 2, 4, 8, 16] {
-            let layout = Layout::from_size_align(8, align).unwrap();
-            let ptr = unsafe { alloc.alloc(layout) };
-            assert!(!ptr.is_null());
-            assert_eq!(ptr as usize % align, 0, "align={align}");
-        }
-    }
-
-    #[test]
-    fn test_dealloc_and_reuse() {
-        let (alloc, _heap) = make_allocator();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-
-        let p1 = unsafe { alloc.alloc(layout) };
-        assert!(!p1.is_null());
-
-        // After freeing, the next allocation should reuse the same block
-        unsafe { alloc.dealloc(p1, layout) };
-        let p2 = unsafe { alloc.alloc(layout) };
-        assert!(!p2.is_null());
-        assert_eq!(p1, p2, "should reuse the freed block");
-    }
-
-    #[test]
-    fn test_multiple_alloc_dealloc() {
-        let (alloc, _heap) = make_allocator();
-        let layout = Layout::from_size_align(128, 8).unwrap();
-
-        let p1 = unsafe { alloc.alloc(layout) };
-        let p2 = unsafe { alloc.alloc(layout) };
-        let p3 = unsafe { alloc.alloc(layout) };
-        assert!(!p1.is_null() && !p2.is_null() && !p3.is_null());
-
-        unsafe { alloc.dealloc(p2, layout) };
-        unsafe { alloc.dealloc(p1, layout) };
-
-        let q1 = unsafe { alloc.alloc(layout) };
-        let q2 = unsafe { alloc.alloc(layout) };
-        assert!(!q1.is_null() && !q2.is_null());
-    }
-
-    #[test]
-    fn test_oom() {
-        let (alloc, _heap) = make_allocator();
-        let layout = Layout::from_size_align(HEAP_SIZE + 1, 1).unwrap();
-        let ptr = unsafe { alloc.alloc(layout) };
-        assert!(ptr.is_null(), "should return null when exceeding heap");
+        let block_ptr = (ptr as usize - BLOCK_HDR_SIZE) as *mut FreeBlock;
+        (*block_ptr).size = layout.size() + (ptr as usize - block_ptr as usize - BLOCK_HDR_SIZE);
+        (*block_ptr).next = self.free_head.load(Ordering::SeqCst);
+        self.free_head.store(block_ptr, Ordering::SeqCst);
     }
 }

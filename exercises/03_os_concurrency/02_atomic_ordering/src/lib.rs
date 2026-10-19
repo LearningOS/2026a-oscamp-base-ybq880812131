@@ -1,24 +1,9 @@
 //! # Memory Ordering and Synchronization
 //!
-//! In this exercise, you will use correct memory ordering to implement thread synchronization primitives.
-//!
-//! ## Key Concepts
-//! - `Ordering::Relaxed`: No synchronization guarantees
-//! - `Ordering::Acquire`: Read operation, prevents subsequent reads/writes from being reordered before this operation
-//! - `Ordering::Release`: Write operation, prevents preceding reads/writes from being reordered after this operation
-//! - `Ordering::AcqRel`: Both Acquire and Release semantics
-//! - `Ordering::SeqCst`: Sequentially consistent (global ordering)
-//!
-//! ## Release-Acquire Pairing
-//! When thread A writes with Release, and thread B reads the same location with Acquire,
-//! thread B will see all writes that thread A performed before the Release.
+//! Use correct memory ordering to implement thread synchronization primitives.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// Use Release-Acquire semantics to safely pass data between two threads.
-///
-/// `produce` writes data first, then sets flag with Release;
-/// `consume` reads flag with Acquire, ensuring it sees the data.
 pub struct FlagChannel {
     data: AtomicU32,
     ready: AtomicBool,
@@ -32,37 +17,24 @@ impl FlagChannel {
         }
     }
 
-    /// Producer: store data first, then set ready flag.
-    ///
-    /// TODO: Choose correct Ordering
-    /// - What Ordering should be used for writing data?
-    /// - What Ordering should be used for writing ready? (ensuring data writes are visible to consumer)
     pub fn produce(&self, value: u32) {
-        // TODO: Store data (choose appropriate Ordering)
-        // TODO: Set ready = true (choose appropriate Ordering so data writes complete before this)
-        todo!()
+        self.data.store(value, Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
     }
 
-    /// Consumer: spin-wait for ready flag, then read data.
-    ///
-    /// TODO: Choose correct Ordering
-    /// - What Ordering should be used for reading ready? (ensuring it sees data writes from produce)
-    /// - What Ordering should be used for reading data?
     pub fn consume(&self) -> u32 {
-        // TODO: Spin-wait for ready to become true (choose appropriate Ordering)
-        // TODO: Read data (choose appropriate Ordering)
-        todo!()
+        while !self.ready.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        self.data.load(Ordering::Relaxed)
     }
 
-    /// Reset channel state
     pub fn reset(&self) {
         self.ready.store(false, Ordering::Relaxed);
         self.data.store(0, Ordering::Relaxed);
     }
 }
 
-/// A simple once-initializer using SeqCst.
-/// Guarantees `init` is executed only once, and all threads see the initialized value.
 pub struct OnceCell {
     initialized: AtomicBool,
     value: AtomicU32,
@@ -76,20 +48,25 @@ impl OnceCell {
         }
     }
 
-    /// Attempt initialization. If not yet initialized, store value and return true.
-    /// If already initialized, return false.
-    ///
-    /// Hint: use `compare_exchange` to ensure only one thread succeeds.
     pub fn init(&self, val: u32) -> bool {
-        // TODO: Use compare_exchange to ensure initialization only once
-        // Store value on success
-        todo!()
+        if self
+            .initialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.value.store(val, Ordering::Release);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Get value. Returns Some if initialized, otherwise None.
     pub fn get(&self) -> Option<u32> {
-        // TODO: Check initialized flag, then read value
-        todo!()
+        if self.initialized.load(Ordering::Acquire) {
+            Some(self.value.load(Ordering::Acquire))
+        } else {
+            None
+        }
     }
 }
 
@@ -154,7 +131,6 @@ mod tests {
         }
 
         let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        // Exactly one thread initializes successfully
         assert_eq!(results.iter().filter(|&&r| r).count(), 1);
         assert!(cell.get().is_some());
     }

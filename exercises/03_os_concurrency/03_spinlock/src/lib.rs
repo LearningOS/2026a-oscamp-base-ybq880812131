@@ -1,18 +1,10 @@
 //! # Spin Lock
 //!
-//! In this exercise, you will implement a basic spin lock.
-//! Spin locks are one of the most fundamental synchronization primitives in OS kernels.
-//!
-//! ## Key Concepts
-//! - Spin locks use busy-waiting to acquire the lock
-//! - `AtomicBool`'s `compare_exchange` to implement lock acquisition
-//! - `core::hint::spin_loop` to reduce CPU power consumption
-//! - `UnsafeCell` provides interior mutability
+//! Implement a basic spin lock.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Basic spin lock
 pub struct SpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
@@ -29,34 +21,33 @@ impl<T> SpinLock<T> {
         }
     }
 
-    /// Acquire lock, returning a mutable reference to inner data.
-    ///
-    /// TODO: Use compare_exchange to spin until lock is acquired
-    /// 1. In a loop, try to change locked from false to true
-    /// 2. Success uses Acquire ordering, failure uses Relaxed
-    /// 3. On failure call `core::hint::spin_loop()` to hint CPU
-    /// 4. On success return `&mut *self.data.get()`
-    ///
-    /// # Safety
-    /// Caller must ensure `unlock` is called after using the data.
     pub fn lock(&self) -> &mut T {
-        // TODO
-        todo!()
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+        unsafe { &mut *self.data.get() }
     }
 
-    /// Release lock.
-    ///
-    /// TODO: Set locked to false (using Release ordering)
     pub fn unlock(&self) {
-        // TODO
-        todo!()
+        self.locked.store(false, Ordering::Release);
     }
 
-    /// Try to acquire lock without spinning.
-    /// Returns Some(&mut T) on success, None if lock is busy.
     pub fn try_lock(&self) -> Option<&mut T> {
-        // TODO: Single compare_exchange attempt
-        todo!()
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(unsafe { &mut *self.data.get() })
+        } else {
+            None
+        }
     }
 }
 

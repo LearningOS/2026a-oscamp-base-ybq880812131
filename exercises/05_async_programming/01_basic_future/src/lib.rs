@@ -1,90 +1,126 @@
-//! # Manual Future Implementation
-//!
-//! In this exercise, you will manually implement the `Future` trait for custom types to understand the core mechanism of asynchronous runtime.
-//!
-//! ## Concepts
-//! - `std::future::Future` trait
-//! - `Poll::Ready` and `Poll::Pending`
-//! - The role of `Waker`: notifying the runtime to poll again
+//! # Basic Future: Implement a simple Future manually
 
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+use std::sync::Arc;
 
-/// Countdown Future: decrements count by 1 each time it's polled,
-/// returns `"liftoff!"` when count reaches 0.
-pub struct CountDown {
-    pub count: u32,
+pub struct CounterFuture {
+    target: u32,
+    current: Arc<AtomicU32>,
+    waker: Option<Waker>,
 }
 
-impl CountDown {
-    pub fn new(count: u32) -> Self {
-        Self { count }
+impl CounterFuture {
+    pub fn new(target: u32, current: Arc<AtomicU32>) -> Self {
+        Self {
+            target,
+            current,
+            waker: None,
+        }
+    }
+
+    pub fn increment(&mut self) {
+        self.current.fetch_add(1, Ordering::SeqCst);
+        if self.current.load(Ordering::SeqCst) >= self.target {
+            if let Some(waker) = self.waker.take() {
+                waker.wake();
+            }
+        }
     }
 }
 
-// TODO: Implement Future trait for CountDown
-// - Output type is &'static str
-// - Each poll: if count == 0, return Poll::Ready("liftoff!")
-// - Otherwise count -= 1, call cx.waker().wake_by_ref(), return Poll::Pending
-//
-// Hint: Use `self.get_mut()` to get `&mut Self` (since self is Pin<&mut Self>)
-impl Future for CountDown {
-    type Output = &'static str;
+impl Future for CounterFuture {
+    type Output = u32;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let cur = self.current.load(Ordering::SeqCst);
+        if cur >= self.target {
+            Poll::Ready(cur)
+        } else {
+            self.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 
-/// Yield-only-once Future: first poll returns Pending, second returns Ready(()).
-/// This is the minimal example of an asynchronous state machine.
-pub struct YieldOnce {
-    yielded: bool,
+pub struct ManualWaker {
+    woken: AtomicBool,
 }
 
-impl YieldOnce {
-    pub fn new() -> Self {
-        Self { yielded: false }
+impl Wake for ManualWaker {
+    fn wake(self: Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
     }
 }
 
-// TODO: Implement Future trait for YieldOnce
-// - Output type is ()
-// - First poll: set yielded = true, wake waker, return Pending
-// - Second poll: return Ready(())
-impl Future for YieldOnce {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
-    }
+pub fn create_waker() -> (Waker, Arc<ManualWaker>) {
+    let inner = Arc::new(ManualWaker {
+        woken: AtomicBool::new(false),
+    });
+    let waker = inner.clone().into();
+    (waker, inner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_countdown_zero() {
-        let result = CountDown::new(0).await;
-        assert_eq!(result, "liftoff!");
+    #[test]
+    fn test_ready_future() {
+        let counter = Arc::new(AtomicU32::new(10));
+        let mut fut = CounterFuture::new(10, counter);
+        let waker = create_waker();
+        let mut cx = Context::from_waker(&waker.0);
+        let result = Pin::new(&mut fut).poll(&mut cx);
+        assert!(result.is_ready());
     }
 
-    #[tokio::test]
-    async fn test_countdown_three() {
-        let result = CountDown::new(3).await;
-        assert_eq!(result, "liftoff!");
+    #[test]
+    fn test_pending_then_ready() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let mut fut = CounterFuture::new(5, counter.clone());
+        let (waker, handle) = create_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(!handle.woken.load(Ordering::SeqCst));
+
+        for _ in 0..5 {
+            fut.increment();
+        }
+
+        assert!(handle.woken.load(Ordering::SeqCst));
+        let mut cx2 = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx2),
+            Poll::Ready(5)
+        ));
     }
 
-    #[tokio::test]
-    async fn test_yield_once() {
-        YieldOnce::new().await;
-    }
+    #[test]
+    fn test_multiple_polls() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let mut fut = CounterFuture::new(3, counter.clone());
+        let (waker, _) = create_waker();
 
-    #[tokio::test]
-    async fn test_countdown_large() {
-        let result = CountDown::new(100).await;
-        assert_eq!(result, "liftoff!");
+        for _ in 0..3 {
+            let mut cx = Context::from_waker(&waker);
+            assert!(matches!(
+                Pin::new(&mut fut).poll(&mut cx),
+                Poll::Pending
+            ));
+            fut.increment();
+        }
+
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(3)
+        ));
     }
 }

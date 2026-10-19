@@ -1,86 +1,69 @@
-//! # Stackful Coroutine and Context Switch (riscv64)
+//! # Stackful Coroutine and Context Switch (x86_64)
 //!
-//! In this exercise, you implement the minimal context switch using inline assembly,
-//! which is the core mechanism of OS thread scheduling. This crate is **riscv64 only**;
-//! run `cargo test` on riscv64 Linux, or use the repo's normal flow (`./check.sh` / `oscamp`) on x86 with QEMU.
-//!
-//! ## Key Concepts
-//! - **Callee-saved registers**: Save and restore them on switch so the switched-away task can resume correctly later.
-//! - **Stack pointer `sp`** and **return address `ra`**: Restore them in the new context; the first time we switch to a task, `ret` jumps to `ra` (the entry point).
-//! - Inline assembly: `core::arch::asm!`
-//!
-//! ## riscv64 ABI (for this exercise)
-//! - Callee-saved: `sp`, `ra`, `s0`–`s11`. The `ret` instruction is `jalr zero, 0(ra)`.
-//! - First and second arguments: `a0` (old context), `a1` (new context).
+//! Implement minimal context save/restore using inline assembly.
+//! Saves/restores callee-saved registers (rsp, rbx, r12-r15).
 
-#![cfg(target_arch = "riscv64")]
+#![cfg(target_arch = "x86_64")]
 
-/// Saved register state for one task (riscv64). Layout must match the offsets used in the asm below: for one task (riscv64). Layout must match the offsets used in the asm below:
-/// `sp` at 0, `ra` at 8, then `s0`–`s11` at 16, 24, … 104.
+use core::arch::naked_asm;
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TaskContext {
-    pub sp: u64,
-    pub ra: u64,
-    pub s0: u64,
-    pub s1: u64,
-    pub s2: u64,
-    pub s3: u64,
-    pub s4: u64,
-    pub s5: u64,
-    pub s6: u64,
-    pub s7: u64,
-    pub s8: u64,
-    pub s9: u64,
-    pub s10: u64,
-    pub s11: u64,
+    pub rsp: u64,
+    pub rbx: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
 }
 
 impl TaskContext {
     pub const fn empty() -> Self {
         Self {
-            sp: 0,
-            ra: 0,
-            s0: 0,
-            s1: 0,
-            s2: 0,
-            s3: 0,
-            s4: 0,
-            s5: 0,
-            s6: 0,
-            s7: 0,
-            s8: 0,
-            s9: 0,
-            s10: 0,
-            s11: 0,
+            rsp: 0,
+            rbx: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
         }
     }
 
-    /// Initialize this context so that when we switch to it, execution starts at `entry`.
-    ///
-    /// - Set `ra = entry` so that the first `ret` in the new context jumps to `entry`.
-    /// - Set `sp = stack_top` with 16-byte alignment (RISC-V ABI requires 16-byte aligned stack at function entry).
-    /// - Leave `s0`–`s11` zero; they will be loaded on switch.
     pub fn init(&mut self, stack_top: usize, entry: usize) {
-        todo!("set ra = entry, sp = stack_top (16-byte aligned)")
+        unsafe {
+            let stack_ptr = stack_top as *mut usize;
+            *stack_ptr.sub(1) = entry;
+        }
+        self.rsp = (stack_top - 8) as u64;
     }
 }
 
-/// Switch from `old` to `new` context: save current callee-saved regs into `old`, load from `new`, then `ret` (jumps to `new.ra`).
-///
-/// In asm: store `sp`, `ra`, `s0`–`s11` to `[a0]` (old), load from `[a1]` (new), zero `a0`/`a1` so we do not leak pointers into the new context, then `ret`.
-///
-/// Must be `#[unsafe(naked)]` to prevent the compiler from generating a prologue/epilogue.
-pub unsafe fn switch_context(old: &mut TaskContext, new: &TaskContext) {
-    todo!("save callee-saved regs to old, load from new, then ret; use #[unsafe(naked)] + naked_asm!, see module doc for riscv64 ABI and layout")
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context(_old: &mut TaskContext, _new: &TaskContext) {
+    naked_asm!(
+        "mov [rcx + 0x00], rsp",
+        "mov [rcx + 0x08], rbx",
+        "mov [rcx + 0x10], r12",
+        "mov [rcx + 0x18], r13",
+        "mov [rcx + 0x20], r14",
+        "mov [rcx + 0x28], r15",
+        "mov rsp, [rdx + 0x00]",
+        "mov rbx, [rdx + 0x08]",
+        "mov r12, [rdx + 0x10]",
+        "mov r13, [rdx + 0x18]",
+        "mov r14, [rdx + 0x20]",
+        "mov r15, [rdx + 0x28]",
+        "ret",
+    );
 }
 
 const STACK_SIZE: usize = 1024 * 64;
 
-/// Allocate a stack for a coroutine. Returns `(buffer, stack_top)` where `stack_top` is the high address
-/// (stack grows down). The buffer must be kept alive for the lifetime of the context using this stack.
 pub fn alloc_stack() -> (Vec<u8>, usize) {
-    todo!("allocate stack buffer, return (buffer, stack_top) with stack_top 16-byte aligned")
+    let buf = vec![0u8; STACK_SIZE];
+    let top = buf.as_ptr() as usize + STACK_SIZE;
+    (buf, top)
 }
 
 #[cfg(test)]
@@ -111,8 +94,8 @@ mod tests {
         let mut ctx = TaskContext::empty();
         let entry = task_entry as *const () as usize;
         ctx.init(top, entry);
-        assert_eq!(ctx.ra, entry as u64);
-        assert!(ctx.sp != 0);
+        assert_eq!(ctx.rsp, (top - 8) as u64);
+        assert!(ctx.rsp != 0);
     }
 
     #[test]

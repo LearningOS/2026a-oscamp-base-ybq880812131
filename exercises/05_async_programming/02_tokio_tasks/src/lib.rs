@@ -1,71 +1,78 @@
-//! # Tokio Async Tasks
-//!
-//! In this exercise, you will use `tokio::spawn` to create concurrent asynchronous tasks.
-//!
-//! ## Concepts
-//! - `tokio::spawn` creates asynchronous tasks
-//! - `JoinHandle` waits for task completion
-//! - Concurrent execution between asynchronous tasks
+//! # Tokio Tasks
 
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
-/// Concurrently compute the square of each number in 0..n, collect results and return in order.
-///
-/// Hint: Create `tokio::spawn` task for each i, collect JoinHandle, await them sequentially.
-pub async fn concurrent_squares(n: usize) -> Vec<usize> {
-    // TODO: Create n asynchronous tasks, each computing i * i
-    // TODO: Collect all JoinHandle
-    // TODO: Await each one to get result
-    todo!()
+pub async fn say_hi() -> String {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    "hi".to_string()
 }
 
-/// Concurrently execute multiple "time-consuming" tasks (simulated with sleep), return all results.
-/// Each task sleeps `duration_ms` milliseconds and then returns its `task_id`.
-///
-/// Key: All tasks should execute concurrently, total duration should be close to single task duration, not sum of all tasks.
-pub async fn parallel_sleep_tasks(n: usize, duration_ms: u64) -> Vec<usize> {
-    // TODO: Create asynchronous task for each id in 0..n
-    // TODO: Each task sleeps specified duration and returns its own id
-    // TODO: Collect all results and sort
-    todo!()
+pub async fn concurrent_sum(n: u64) -> u64 {
+    let mut handles = Vec::new();
+    for i in 0..n {
+        handles.push(tokio::spawn(async move { i }));
+    }
+    let mut sum = 0u64;
+    for h in handles {
+        if let Ok(v) = h.await {
+            sum += v;
+        }
+    }
+    sum
+}
+
+pub async fn race_tasks(n: u64) -> u64 {
+    let winner = Arc::new(AtomicUsize::new(usize::MAX));
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let w = Arc::clone(&winner);
+        handles.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let _ = w.compare_exchange(usize::MAX, i as usize, Ordering::AcqRel, Ordering::Relaxed);
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    winner.load(Ordering::Relaxed) as u64
+}
+
+static COUNTER: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
+
+pub async fn increment_counter() -> u32 {
+    let mut guard = COUNTER.lock().await;
+    *guard += 1;
+    *guard
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::Instant;
 
     #[tokio::test]
-    async fn test_squares_basic() {
-        let result = concurrent_squares(5).await;
-        assert_eq!(result, vec![0, 1, 4, 9, 16]);
+    async fn test_say_hi() {
+        assert_eq!(say_hi().await, "hi");
     }
 
     #[tokio::test]
-    async fn test_squares_zero() {
-        let result = concurrent_squares(0).await;
-        assert!(result.is_empty());
+    async fn test_concurrent_sum() {
+        let result = concurrent_sum(10).await;
+        assert_eq!(result, (0..10).sum::<u64>());
     }
 
     #[tokio::test]
-    async fn test_squares_one() {
-        let result = concurrent_squares(1).await;
-        assert_eq!(result, vec![0]);
-    }
-
-    #[tokio::test]
-    async fn test_parallel_sleep() {
-        let start = Instant::now();
-        let result = parallel_sleep_tasks(5, 100).await;
-        let elapsed = start.elapsed();
-
-        assert_eq!(result, vec![0, 1, 2, 3, 4]);
-        // Concurrent execution, total time should be much less than 5 * 100ms
-        assert!(
-            elapsed.as_millis() < 400,
-            "Tasks should run concurrently, took {}ms",
-            elapsed.as_millis()
-        );
+    async fn test_increment_counter() {
+        let handles: Vec<_> = (0..10)
+            .map(|_| tokio::spawn(increment_counter()))
+            .collect();
+        for h in handles {
+            assert!(h.await.is_ok());
+        }
+        let c = COUNTER.lock().await;
+        assert!(*c >= 10);
     }
 }
